@@ -362,27 +362,107 @@ class LibvaGpuSelector:
 
 ## 3. Python Process Management
 
-### 3.1 Process Architecture Overview
+### 3.1 Process vs Thread Clarification
 
-**Source Files:** `frigate/video.py`, `frigate/util/process.py`
+**IMPORTANT: These are REAL OS Processes, NOT Python Threads**
+
+**Source Files:** `frigate/util/process.py`, `frigate/__main__.py`
+
+`FrigateProcess` inherits from `multiprocessing.Process` - these are **real OS processes** with:
+- Separate PID
+- Separate memory space
+- Separate Python interpreter
+- True parallelism (bypasses Python GIL)
+
+```python
+# frigate/util/process.py:19-35
+class BaseProcess(mp.Process):  # Inherits from multiprocessing.Process
+    def __init__(self, stop_event: MpEvent, priority: int, ...):
+        super().__init__(...)  # Real OS process
+```
+
+**Process Spawning Method:**
+```python
+# frigate/__main__.py:135
+mp.set_start_method("forkserver", force=True)  # Not fork, not spawn
+mp.set_forkserver_preload([
+    "sqlite3", "numpy", "cv2", "peewee", "zmq",
+    "frigate.camera.maintainer",
+])
+```
+
+**Why forkserver?**
+- A "fork server" process is created at startup
+- New processes fork from the server (not the main process)
+- Heavy libraries preloaded once, inherited by all children
+- Better memory efficiency for many processes
+
+### 3.2 Process Architecture Overview
 
 ```
-FrigateApp (Main Process)
+FrigateApp (Main Process - PID 1)
 │
-├── Per-Camera Processes:
-│   ├── CameraCapture (FrigateProcess)      # FFmpeg + frame capture
-│   │   └── CameraWatchdog (Thread)         # Monitors FFmpeg health
-│   │       └── CameraCaptureRunner (Thread) # Reads frames from pipe
-│   └── CameraTracker (FrigateProcess)      # Motion + detection
+│   ═══════════════════════════════════════════════════
+│   REAL OS PROCESSES (multiprocessing.Process)
+│   Each has its own PID, memory space, Python interpreter
+│   ═══════════════════════════════════════════════════
 │
-├── Shared Processes:
-│   ├── ObjectDetectProcess                 # Shared detector
-│   ├── RecordProcess                       # Recording management
-│   ├── ReviewProcess                       # Event review
-│   └── StorageMaintainer                   # Storage cleanup
+├── CameraCapture (Process - PID 100)      # Separate OS process
+│   │
+│   │   ─────────────────────────────────────────────
+│   │   THREADS (threading.Thread) - within the process
+│   │   Share memory, same PID, lightweight
+│   │   ─────────────────────────────────────────────
+│   │
+│   └── CameraWatchdog (Thread)            # Thread inside PID 100
+│       └── CameraCaptureRunner (Thread)   # Thread inside PID 100
+│
+├── CameraTracker (Process - PID 101)      # Another separate process
+│
+├── ObjectDetectProcess (Process - PID 102)
+├── RecordProcess (Process - PID 103)
+├── ReviewProcess (Process - PID 104)
+└── StorageMaintainer (Process - PID 105)
 ```
 
-### 3.2 FFmpeg Process Spawning
+**NOT Uvicorn - Direct Python Execution:**
+```python
+# frigate/__main__.py
+if __name__ == "__main__":
+    frigate_app = FrigateApp()
+    frigate_app.start()  # Starts all processes directly
+```
+
+The web API (Flask/FastAPI) runs inside the main process, but camera/detection work runs in separate processes.
+
+**Why Real Processes (Not Threads)?**
+1. **Python GIL bypass** - Threads can't run Python code in parallel; processes can
+2. **Crash isolation** - If CameraCapture crashes, it doesn't take down the detector
+3. **True parallelism** - Each process uses a different CPU core
+4. **Memory isolation** - One camera's memory leak doesn't affect others
+
+**You can see them in `ps`:**
+```bash
+$ ps aux | grep frigate
+frigate    1  ...  frigate (main)
+frigate  100  ...  frigate.capture:front_door
+frigate  101  ...  frigate.process:front_door
+frigate  102  ...  frigate.detect
+frigate  103  ...  frigate.record
+```
+
+### 3.3 Inter-Process Communication (IPC)
+
+Since they're real processes, they use IPC mechanisms:
+
+| Mechanism | Used For | Location |
+|-----------|----------|----------|
+| `multiprocessing.Queue` | Detection requests, event queues | Between camera and detector |
+| Shared Memory (`/dev/shm`) | Frame buffers (zero-copy) | `frigate/util/image.py` |
+| ZMQ Pub/Sub | Detection results, config updates | `ipc:///tmp/cache/detector_pub` |
+| `multiprocessing.Value` | Metrics (FPS, timestamps) | Shared counters |
+
+### 3.4 FFmpeg Process Spawning
 
 **Source File:** `frigate/video.py:74-97`
 
@@ -421,7 +501,7 @@ def start_or_restart_ffmpeg(
     return process
 ```
 
-### 3.3 FFmpeg Process Termination
+### 3.5 FFmpeg Process Termination
 
 **Source File:** `frigate/video.py:61-71`
 
@@ -439,7 +519,7 @@ def stop_ffmpeg(ffmpeg_process: sp.Popen[Any], logger: logging.Logger):
         ffmpeg_process.communicate()
 ```
 
-### 3.4 LogPipe - Capturing FFmpeg Stderr
+### 3.6 LogPipe - Capturing FFmpeg Stderr
 
 **Source File:** `frigate/log.py:108-141`
 
@@ -493,7 +573,7 @@ logpipe.dump()
 logpipe.close()
 ```
 
-### 3.5 CameraWatchdog - FFmpeg Health Monitoring
+### 3.7 CameraWatchdog - FFmpeg Health Monitoring
 
 **Source File:** `frigate/video.py:168-430`
 
@@ -543,7 +623,7 @@ class CameraWatchdog(threading.Thread):
 | No recording segments | 120 seconds | Restart recording FFmpeg |
 | Process poll() not None | Immediate | Restart that process |
 
-### 3.6 Frame Capture from FFmpeg Pipe
+### 3.8 Frame Capture from FFmpeg Pipe
 
 **Source File:** `frigate/video.py:100-165`
 
@@ -596,7 +676,7 @@ def capture_frames(
         frame_index = 0 if frame_index == shm_frame_count - 1 else frame_index + 1
 ```
 
-### 3.7 Shared Memory Frame Management
+### 3.9 Shared Memory Frame Management
 
 **Source File:** `frigate/util/image.py:838-909`
 
@@ -642,7 +722,7 @@ class SharedMemoryFrameManager(FrameManager):
 Example: front_door_frame0, front_door_frame1, front_door_frame2, ...
 ```
 
-### 3.8 FrigateProcess Base Class
+### 3.10 FrigateProcess Base Class
 
 **Source File:** `frigate/util/process.py:49-118`
 
@@ -680,101 +760,224 @@ PROCESS_PRIORITY_LOW = 19    # Storage cleanup
 
 ## 4. Image Snapshots and Video Recording
 
-### 4.1 Live Snapshot Creation (In-Memory)
+### 4.1 What is a Snapshot?
 
-**Source File:** `frigate/track/tracked_object.py:565-618`
+A **snapshot** is a single JPEG/WebP image captured when an object is detected. It represents the "best frame" of a tracked object event.
 
-Snapshots are created from in-memory frames using OpenCV, **NOT** FFmpeg:
+**Key characteristics:**
+- Created from **in-memory frames**, NOT from disk
+- Uses **OpenCV** for encoding, NOT FFmpeg
+- Stored to **disk** after encoding
+- Two versions saved: with overlays (JPG) and clean (WebP)
 
+### 4.2 Snapshot Storage Locations
+
+**Source File:** `frigate/const.py`
+
+```
+/media/frigate/clips/                      # CLIPS_DIR
+├── {camera}-{object_id}.jpg               # Snapshot WITH overlays
+├── {camera}-{object_id}-clean.webp        # Clean snapshot (no overlays)
+├── thumbs/                                # Thumbnails
+│   └── {camera}-{object_id}.webp          # 175px cropped thumbnail
+└── export/                                # Export thumbnails
+```
+
+### 4.3 Snapshot Creation Flow (In-Memory → Disk)
+
+**Source File:** `frigate/track/tracked_object.py:435-600`
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Step 1: Frame in Shared Memory (YUV420p raw)               │
+│   - FFmpeg outputs to stdout pipe                          │
+│   - CameraCaptureRunner reads into SharedMemoryFrameManager│
+│   - Frame buffer: /dev/shm/{camera}_frame{N}               │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Step 2: Frame Cache (In-Memory Dict)                       │
+│   - TrackedObject maintains frame_cache dict               │
+│   - Stores recent frames with detection data               │
+│   - Selects "best frame" (highest confidence + area)       │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Step 3: Color Conversion (OpenCV)                          │
+│   cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)              │
+│   - Converts YUV420p → BGR for processing                  │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Step 4: Overlay Rendering (OpenCV)                         │
+│   - Bounding boxes: cv2.rectangle()                        │
+│   - Labels: draw_box_with_label()                          │
+│   - Timestamps: draw_timestamp()                           │
+│   - Crop to object region if configured                    │
+│   - Resize to configured height                            │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Step 5: Encode & Write to Disk                             │
+│   cv2.imencode(".jpg", frame, [IMWRITE_JPEG_QUALITY, 70])  │
+│   → /media/frigate/clips/{camera}-{id}.jpg                 │
+│                                                            │
+│   cv2.imencode(".webp", frame, [IMWRITE_WEBP_QUALITY, 60]) │
+│   → /media/frigate/clips/{camera}-{id}-clean.webp          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Code for snapshot creation:**
 ```python
+# frigate/track/tracked_object.py:565-600
 def write_snapshot_to_disk(self) -> None:
     snapshot_config = self.camera_config.snapshots
 
-    # Get the best frame for this tracked object
+    # Get best frame from IN-MEMORY cache (not disk!)
     jpg_bytes = self.get_img_bytes(
         ext="jpg",
-        timestamp=snapshot_config.timestamp,      # Add timestamp overlay
-        bounding_box=snapshot_config.bounding_box, # Add bounding box
-        crop=snapshot_config.crop,                # Crop to object
-        height=snapshot_config.height,            # Resize height
-        quality=snapshot_config.quality,          # JPEG quality (0-100)
+        timestamp=snapshot_config.timestamp,
+        bounding_box=snapshot_config.bounding_box,
+        crop=snapshot_config.crop,
+        height=snapshot_config.height,
+        quality=snapshot_config.quality,
     )
 
-    # Save JPEG with overlays
+    # Write to disk
     with open(f"{CLIPS_DIR}/{camera}-{object_id}.jpg", "wb") as f:
         f.write(jpg_bytes)
+
+    # Also write clean WebP copy (no overlays)
+    if snapshot_config.clean_copy:
+        webp_bytes = self.get_clean_webp()
+        with open(f"{CLIPS_DIR}/{camera}-{id}-clean.webp", "wb") as f:
+            f.write(webp_bytes)
 ```
 
-**Frame Processing Pipeline:**
-```
-1. FFmpeg outputs raw YUV420p frame
-2. Frame stored in shared memory
-3. TrackedObject selects "best frame" (highest confidence)
-4. Convert: cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
-5. Draw overlays: cv2.rectangle(), cv2.putText()
-6. Encode: cv2.imencode(".jpg", frame, [IMWRITE_JPEG_QUALITY, 70])
-7. Save: {camera}-{id}.jpg + {camera}-{id}-clean.webp
-```
+### 4.4 On-Demand Snapshot from Recording (FFmpeg)
 
-### 4.2 On-Demand Snapshot from Recording
+For extracting frames from **saved recordings** (not live):
 
 **Source File:** `frigate/util/image.py:946-996`
 
-For extracting frames from saved recordings:
-
 ```python
-def run_ffmpeg_snapshot(
-    ffmpeg,
-    input_path: str,
-    codec: str,           # "mjpeg" or "png"
-    seek_time: Optional[float] = None,
-    height: Optional[int] = None,
-    timeout: Optional[int] = None,
-) -> tuple[Optional[bytes], str]:
+def run_ffmpeg_snapshot(ffmpeg, input_path, codec, seek_time=None, height=None):
     ffmpeg_cmd = [
         ffmpeg.ffmpeg_path,
-        "-hide_banner",
-        "-loglevel", "warning",
-    ]
-
-    # Seek to specific time (fast seek before input)
-    if seek_time is not None:
-        ffmpeg_cmd.extend(["-ss", f"00:00:{seek_time}"])
-
-    ffmpeg_cmd.extend([
-        "-i", input_path,
-        "-frames:v", "1",      # Extract single frame
-        "-c:v", codec,         # JPEG or PNG
-        "-f", "image2pipe",    # Output to pipe
+        "-hide_banner", "-loglevel", "warning",
+        "-ss", f"00:00:{seek_time}",    # Seek to timestamp
+        "-i", input_path,                # Recording file
+        "-frames:v", "1",                # Single frame
+        "-c:v", codec,                   # mjpeg or png
+        "-f", "image2pipe",              # Output to pipe
         "-",
-    ])
-
-    # Optional scaling
-    if height is not None:
-        ffmpeg_cmd.insert(-3, "-vf")
-        ffmpeg_cmd.insert(-3, f"scale=-1:{height}")
-
-    process = sp.run(ffmpeg_cmd, capture_output=True, timeout=timeout)
-    return process.stdout, ""  # Returns JPEG/PNG bytes
+    ]
+    process = sp.run(ffmpeg_cmd, capture_output=True)
+    return process.stdout  # JPEG/PNG bytes
 ```
 
-### 4.3 Recording Segment Pipeline
+### 4.5 Recording: How It Works
 
-**Recording Output Path:**
+**Recording is NOT snapshot-based** - it's continuous video segments.
+
+**Two-Stage Process:**
+1. **FFmpeg writes** 10-second MP4 segments to `/tmp/cache/`
+2. **RecordingMaintainer** moves valid segments to permanent storage
+
+### 4.6 Recording Storage & Seeking
+
+**Recording Storage Structure:**
+```
+/media/frigate/recordings/
+├── 2024-01-15/                    # Date (UTC)
+│   ├── 00/                        # Hour (UTC)
+│   │   ├── front_door/
+│   │   │   ├── 00.00.mp4          # MM.SS = start time
+│   │   │   ├── 00.10.mp4          # 10 seconds later
+│   │   │   ├── 00.20.mp4
+│   │   │   └── ...
+│   │   └── backyard/
+│   ├── 01/
+│   └── ...
+```
+
+**Segment Filename Format:**
+- `{MM.SS}.mp4` where MM = minute, SS = second of start time
+- Each segment is ~10 seconds (configurable up to 600s max)
+
+### 4.7 Recording Playback & Seeking (HLS/VOD)
+
+**Source File:** `frigate/api/media.py:835-900`
+
+Frigate serves recordings via **HLS (HTTP Live Streaming)**:
+
+```
+GET /vod/{camera}/start/{start_ts}/end/{end_ts}/index.m3u8
+```
+
+**How seeking works:**
+1. API receives time range request
+2. Query database for matching recording segments
+3. Generate HLS playlist with segment references
+4. Player fetches segments as needed
+
 ```python
-# From frigate/config/camera/camera.py:223
-output_path = f"{CACHE_DIR}/{camera_name}@{CACHE_SEGMENT_FORMAT}.mp4"
-# Example: /tmp/cache/front_door@20251129143000+0000.mp4
+# frigate/api/media.py:840-890
+async def vod_ts(camera_name: str, start_ts: float, end_ts: float):
+    # Query recordings in time range
+    recordings = Recordings.select().where(
+        Recordings.start_time.between(start_ts, end_ts)
+    ).where(Recordings.camera == camera_name)
+
+    # Build clip list with seek offsets
+    clips = []
+    for recording in recordings:
+        clip = {"type": "source", "path": recording.path}
+
+        # Adjust start offset if start_ts is after recording.start_time
+        if start_ts > recording.start_time:
+            clip["clipFrom"] = int((start_ts - recording.start_time) * 1000)
+
+        clips.append(clip)
+
+    return {"clips": clips, "durations": durations}
 ```
 
-**Segment Movement to Permanent Storage:**
+### 4.8 Recording Joining (Export/Clip)
+
+**Source File:** `frigate/api/media.py:727-832`
+
+When exporting a clip, segments are joined using FFmpeg concat:
+
 ```python
-# From frigate/record/maintainer.py
-# FFmpeg adds faststart for better seeking:
-ffmpeg -y -i {cache_path} -c copy -movflags +faststart {final_path}
+# frigate/api/media.py:782-827
+# 1. Create concat playlist file
+with open(file_path, "w") as file:
+    for clip in recordings:
+        file.write(f"file '{clip.path}'\n")
+        if clip.start_time < start_ts:
+            file.write(f"inpoint {int(start_ts - clip.start_time)}\n")
+        if clip.end_time > end_ts:
+            file.write(f"outpoint {int(end_ts - clip.start_time)}\n")
 
-# Final path: /media/frigate/recordings/{YYYY-MM-DD}/{HH}/{camera}/{MM.SS}.mp4
+# 2. FFmpeg concat demuxer joins them
+ffmpeg_cmd = [
+    config.ffmpeg.ffmpeg_path,
+    "-f", "concat",
+    "-safe", "0",
+    "-i", file_path,             # Playlist file
+    "-c", "copy",                # No re-encoding
+    "-movflags", "frag_keyframe+empty_moov",
+    "-f", "mp4",
+    "pipe:",                     # Stream output
+]
 ```
+
+**Export vs Streaming:**
+| Method | Use Case | Command |
+|--------|----------|---------|
+| HLS/VOD | In-app playback | Returns playlist, player fetches segments |
+| clip.mp4 | Download/export | FFmpeg concat → single MP4 file |
 
 ---
 
@@ -893,10 +1096,99 @@ else:
 
 ## 6. Video Storage Architecture
 
-### 6.1 Directory Structure
+### 6.1 Storage Layer Overview
+
+**Frigate uses a hybrid storage approach:**
+
+| Layer | Technology | Purpose |
+|-------|------------|---------|
+| **Database** | SQLite (with WAL mode) | Metadata, events, recording index |
+| **File System** | Local disk | Video segments, snapshots |
+| **Shared Memory** | POSIX `/dev/shm` | Live frame buffers |
+| **Temp Cache** | `/tmp/cache/` (tmpfs) | Active recording segments |
+
+**NOT used:** Redis, PostgreSQL, cloud storage
+
+### 6.2 Database: SQLite
+
+**Source Files:** `frigate/app.py:165-270`, `frigate/models.py`
+
+```python
+# frigate/app.py:262-270
+db = SqliteVecQueueDatabase(
+    self.config.database.path,  # /config/frigate.db
+    pragmas={
+        "auto_vacuum": "FULL",    # Automatic cleanup
+        "cache_size": -512 * 1000, # 512MB cache
+        "synchronous": "NORMAL",   # WAL-safe mode
+    },
+    timeout=max(60, 10 * num_cameras)
+)
+```
+
+**Database Location:** `/config/frigate.db`
+
+**SQLite Configuration:**
+- **WAL mode** (Write-Ahead Logging) for concurrent reads/writes
+- **512MB cache** for performance
+- **Auto-vacuum FULL** for automatic space reclamation
+- **SqliteQueueDatabase** - thread-safe wrapper from Peewee
+
+### 6.3 Database Schema (Key Tables)
+
+**Source File:** `frigate/models.py`
+
+#### Recordings Table
+```python
+class Recordings(Model):
+    id = CharField(primary_key=True)      # "{timestamp}-{rand_id}"
+    camera = CharField(index=True)         # Camera name
+    path = CharField(unique=True)          # Full file path
+
+    start_time = DateTimeField()           # Segment start (UTC)
+    end_time = DateTimeField()             # Segment end (UTC)
+    duration = FloatField()                # Duration in seconds
+
+    # Metrics for retention decisions
+    motion = IntegerField()                # Motion frame count
+    objects = IntegerField()               # Active object count
+    regions = IntegerField()               # Detection region count
+    dBFS = IntegerField()                  # Audio level (decibels)
+    segment_size = FloatField()            # Size in MB
+```
+
+#### Event Table
+```python
+class Event(Model):
+    id = CharField(primary_key=True)
+    label = CharField(index=True)          # "person", "car", etc.
+    camera = CharField(index=True)
+    start_time = DateTimeField()
+    end_time = DateTimeField()
+
+    has_clip = BooleanField(default=True)  # Has associated recording
+    has_snapshot = BooleanField(default=True)  # Has snapshot image
+    thumbnail = TextField()                 # Base64 encoded thumbnail
+    retain_indefinitely = BooleanField()   # Don't auto-delete
+    data = JSONField()                      # Detection metadata
+```
+
+#### ReviewSegment Table
+```python
+class ReviewSegment(Model):
+    id = CharField(primary_key=True)
+    camera = CharField(index=True)
+    start_time = DateTimeField()
+    end_time = DateTimeField()
+    severity = CharField()                 # "alert" or "detection"
+    thumb_path = CharField(unique=True)    # Thumbnail file path
+    data = JSONField()                     # Labels, zones, motion data
+```
+
+### 6.4 Directory Structure
 
 ```
-/media/frigate/                    # BASE_DIR
+/media/frigate/                    # BASE_DIR (persistent storage)
 ├── recordings/                    # RECORD_DIR
 │   └── {YYYY-MM-DD}/              # Date (UTC)
 │       └── {HH}/                  # Hour (UTC)
@@ -906,59 +1198,160 @@ else:
 │   ├── {camera}-{id}.jpg          # Event snapshots
 │   ├── {camera}-{id}-clean.webp   # Clean copies
 │   ├── thumbs/                    # Thumbnails
-│   └── previews/                  # Preview clips
+│   ├── faces/                     # Face recognition images
+│   └── previews/                  # Hour-long preview clips
 └── exports/                       # User exports
 
-/tmp/cache/                        # CACHE_DIR (temporary)
-├── {camera}@{timestamp}.mp4       # Live recording segments
-└── preview_frames/                # Preview frame cache
+/config/                           # CONFIG_DIR
+├── frigate.db                     # SQLite database
+├── frigate.db-wal                 # WAL file
+└── model_cache/                   # ML model cache
+
+/tmp/cache/                        # CACHE_DIR (tmpfs - RAM)
+├── {camera}@{timestamp}.mp4       # Active recording segments
+├── preview_frames/                # Preview frame cache
+└── birdseye                       # Birdseye pipe
 ```
 
-### 6.2 Three-Stage Recording Pipeline
+### 6.5 Three-Stage Recording Pipeline
 
 ```
-Stage 1: Live Cache
+Stage 1: Live Cache (RAM - /tmp/cache/)
     FFmpeg writes → /tmp/cache/{camera}@%Y%m%d%H%M%S%z.mp4
     Max segments: 6 (MAX_SEGMENTS_IN_CACHE)
     Segment duration: up to 10 minutes (MAX_SEGMENT_DURATION=600s)
 
-         ↓ RecordingMaintainer (every 5 seconds)
+         ↓ RecordingMaintainer runs every 5 seconds
 
 Stage 2: Validation & Decision
-    - Validate video with ffprobe
-    - Calculate: motion_count, object_count, dBFS
+    - Check if file in use (psutil.process_iter)
+    - Get video properties (ffprobe)
+    - Calculate metrics:
+      • motion_count (frames with motion)
+      • active_object_count (detected objects)
+      • region_count (detection regions)
+      • average_dBFS (audio level)
     - Apply retention policy
     - Decision: KEEP or DISCARD
 
          ↓ If KEEP
 
 Stage 3: Permanent Storage
-    ffmpeg -i {cache} -c copy -movflags +faststart {final}
-    → /media/frigate/recordings/{date}/{hour}/{camera}/{MM.SS}.mp4
-    → Database: INSERT INTO Recordings (...)
+    # Add faststart for better seeking
+    ffmpeg -y -i {cache} -c copy -movflags +faststart {final}
+
+    # File: /media/frigate/recordings/{YYYY-MM-DD}/{HH}/{camera}/{MM.SS}.mp4
+    # Database: INSERT INTO Recordings (id, camera, path, start_time, ...)
 ```
 
-### 6.3 Retention Logic
+**Source File:** `frigate/record/maintainer.py:489-577`
+
+```python
+async def move_segment(self, camera, start_time, end_time, duration, cache_path, store_mode):
+    segment_info = self.segment_stats(camera, start_time, end_time)
+
+    # Check if should discard
+    if segment_info.should_discard_segment(store_mode):
+        self.drop_segment(cache_path)
+        return
+
+    # Build directory path
+    directory = os.path.join(RECORD_DIR, start_time.strftime("%Y-%m-%d/%H"), camera)
+    os.makedirs(directory, exist_ok=True)
+    file_path = os.path.join(directory, f"{start_time.strftime('%M.%S.mp4')}")
+
+    # FFmpeg with faststart
+    await asyncio.create_subprocess_exec(
+        self.config.ffmpeg.ffmpeg_path,
+        "-hide_banner", "-y",
+        "-i", cache_path,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        file_path,
+    )
+
+    # Insert into database
+    return {
+        Recordings.id.name: f"{start_time.timestamp()}-{rand_id}",
+        Recordings.camera.name: camera,
+        Recordings.path.name: file_path,
+        Recordings.start_time.name: start_time.timestamp(),
+        Recordings.end_time.name: end_time.timestamp(),
+        Recordings.duration.name: duration,
+        Recordings.motion.name: segment_info.motion_count,
+        Recordings.objects.name: segment_info.active_object_count,
+        Recordings.segment_size.name: segment_size,
+    }
+```
+
+### 6.6 Retention Logic
 
 **Source File:** `frigate/record/maintainer.py:59-78`
 
 ```python
-def should_discard_segment(self, retain_mode: RetainModeEnum) -> bool:
-    # Mode: all - keep everything
-    if retain_mode == RetainModeEnum.all:
-        return False
+class SegmentInfo:
+    def should_discard_segment(self, retain_mode: RetainModeEnum) -> bool:
+        keep = False
 
-    # Mode: motion - keep if motion or audio detected
-    if retain_mode == RetainModeEnum.motion:
-        if self.motion_count > 0 or self.average_dBFS > 0:
-            return False
+        # Mode: all - keep everything
+        if retain_mode == RetainModeEnum.all:
+            keep = True
 
-    # Mode: active_objects - keep only if objects detected
-    if self.active_object_count > 0:
-        return False
+        # Mode: motion - keep if motion or audio detected
+        if retain_mode == RetainModeEnum.motion:
+            if self.motion_count > 0 or self.average_dBFS > 0:
+                keep = True
 
-    return True  # Discard this segment
+        # Mode: active_objects - keep only if objects detected
+        if self.active_object_count > 0:
+            keep = True
+
+        return not keep  # Return True to discard
 ```
+
+### 6.7 Storage Cleanup
+
+**Source File:** `frigate/record/cleanup.py`
+
+Cleanup runs every `expire_interval` minutes (default: 60):
+
+```python
+def expire_recordings():
+    for camera in cameras:
+        # Calculate expiration dates based on config
+        continuous_expire = now - timedelta(days=config.continuous.days)
+        motion_expire = now - timedelta(days=config.motion.days)
+
+        # Query expired recordings
+        expired = Recordings.select().where(
+            Recordings.camera == camera,
+            Recordings.end_time < expire_date
+        )
+
+        for recording in expired:
+            # Check if overlaps with any retained event
+            if not overlaps_review_segment(recording):
+                # Delete file and database entry
+                os.remove(recording.path)
+                recording.delete_instance()
+
+    # Cleanup empty directories
+    remove_empty_directories(RECORD_DIR)
+
+    # Truncate WAL file if > 10MB
+    if wal_size > MAX_WAL_SIZE:
+        db.execute_sql("PRAGMA wal_checkpoint(TRUNCATE)")
+```
+
+### 6.8 Storage Summary
+
+| What | Where | Format | Persistence |
+|------|-------|--------|-------------|
+| Live frames | `/dev/shm/{camera}_frame{N}` | YUV420p raw | Volatile (RAM) |
+| Active recordings | `/tmp/cache/{camera}@{ts}.mp4` | MP4 | Volatile (tmpfs) |
+| Permanent recordings | `/media/frigate/recordings/...` | MP4 | Persistent |
+| Event snapshots | `/media/frigate/clips/{camera}-{id}.jpg` | JPEG/WebP | Persistent |
+| Metadata | `/config/frigate.db` | SQLite | Persistent |
 
 ---
 
