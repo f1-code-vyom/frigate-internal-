@@ -1165,55 +1165,341 @@ SQLite is opened in the **main process only**. Child processes **cannot write di
 └───────────┘          └───────────┘          └───────────┘
 ```
 
-### 6.3 Database Schema (Key Tables)
+### 6.3 Complete Database Schema
+
+**Source Files:** `frigate/models.py`, `migrations/*.py`
+
+Frigate uses **10 persistent tables** plus **2 virtual tables** for semantic search.
+
+---
+
+#### 6.3.1 `recordings` - Video Segment Index
+
+**Purpose:** Index of all stored video segments for playback and retention
+
+```sql
+CREATE TABLE "recordings" (
+    "id"           VARCHAR(30) NOT NULL PRIMARY KEY,  -- "{timestamp}-{rand_id}"
+    "camera"       VARCHAR(20) NOT NULL,              -- Camera name
+    "path"         VARCHAR(255) NOT NULL UNIQUE,      -- Full file path
+    "start_time"   DATETIME NOT NULL,                 -- Segment start (UTC float)
+    "end_time"     DATETIME NOT NULL,                 -- Segment end (UTC float)
+    "duration"     REAL NOT NULL,                     -- Duration in seconds
+    "motion"       INTEGER,                           -- Motion frame count (nullable)
+    "objects"      INTEGER,                           -- Active object count (nullable)
+    "dBFS"         INTEGER,                           -- Audio level in decibels (nullable)
+    "segment_size" REAL DEFAULT 0,                    -- Size in MB
+    "regions"      INTEGER                            -- Detection region count (nullable)
+);
+
+-- Indexes
+CREATE INDEX "recordings_camera" ON "recordings" ("camera");
+CREATE UNIQUE INDEX "recordings_path" ON "recordings" ("path");
+CREATE INDEX "recordings_start_time_end_time" ON "recordings" ("start_time", "end_time");
+CREATE INDEX "recordings_camera_segment_size" ON "recordings" ("camera", "segment_size");
+```
+
+**Key Insight:** The composite index `(start_time, end_time)` enables efficient time-range queries for video playback.
+
+---
+
+#### 6.3.2 `event` - Detected Object Events
+
+**Purpose:** Stores each detected object event (person, car, dog, etc.)
+
+```sql
+CREATE TABLE "event" (
+    "id"                  VARCHAR(30) NOT NULL PRIMARY KEY,  -- Unique event ID
+    "label"               VARCHAR(20) NOT NULL,              -- "person", "car", "dog", etc.
+    "sub_label"           VARCHAR(100),                      -- Sub-classification (nullable)
+    "camera"              VARCHAR(20) NOT NULL,              -- Camera name
+    "start_time"          DATETIME NOT NULL,                 -- When object first detected
+    "end_time"            DATETIME,                          -- When object left (nullable if active)
+    "top_score"           REAL NOT NULL,                     -- Highest confidence score (deprecated)
+    "score"               REAL NOT NULL,                     -- Detection score (deprecated)
+    "false_positive"      INTEGER NOT NULL,                  -- 0/1 boolean
+    "zones"               JSON NOT NULL,                     -- List of zones entered
+    "thumbnail"           TEXT,                              -- Base64 encoded thumbnail (nullable)
+    "has_clip"            INTEGER DEFAULT 1,                 -- Has associated recording
+    "has_snapshot"        INTEGER DEFAULT 1,                 -- Has snapshot image
+    "region"              JSON,                              -- Detection region (deprecated)
+    "box"                 JSON,                              -- Bounding box (deprecated)
+    "area"                INTEGER,                           -- Object area in pixels (deprecated)
+    "retain_indefinitely" INTEGER DEFAULT 0,                 -- Don't auto-delete
+    "ratio"               REAL DEFAULT 1.0,                  -- Aspect ratio (deprecated)
+    "plus_id"             VARCHAR(30),                       -- Frigate+ submission ID
+    "model_hash"          VARCHAR(32),                       -- Model version hash
+    "detector_type"       VARCHAR(32),                       -- Detector used
+    "model_type"          VARCHAR(32),                       -- Model type
+    "data"                JSON                               -- Full detection metadata
+);
+
+-- Indexes
+CREATE INDEX "event_label" ON "event" ("label");
+CREATE INDEX "event_camera" ON "event" ("camera");
+CREATE INDEX "event_label_start_time" ON "event" ("label", "start_time" DESC);
+```
+
+**Note:** Several columns marked `(deprecated)` are kept for backward compatibility but data is now in the `data` JSON field.
+
+---
+
+#### 6.3.3 `reviewsegment` - Review Queue Items
+
+**Purpose:** Groups events into reviewable segments for the UI timeline
+
+```sql
+CREATE TABLE "reviewsegment" (
+    "id"         VARCHAR(30) NOT NULL PRIMARY KEY,  -- Unique segment ID
+    "camera"     VARCHAR(20) NOT NULL,              -- Camera name
+    "start_time" DATETIME NOT NULL,                 -- Segment start
+    "end_time"   DATETIME,                          -- Segment end (nullable if active)
+    "severity"   VARCHAR(30) NOT NULL,              -- "alert" or "detection"
+    "thumb_path" VARCHAR(255) NOT NULL UNIQUE,      -- Thumbnail file path
+    "data"       JSON NOT NULL                      -- Labels, zones, motion areas
+);
+
+-- Indexes
+CREATE INDEX "review_segment_camera" ON "reviewsegment" ("camera");
+CREATE INDEX "review_segment_start_time_end_time" ON "reviewsegment" ("start_time" DESC, "end_time" DESC);
+```
+
+---
+
+#### 6.3.4 `userreviewstatus` - Per-User Review State
+
+**Purpose:** Tracks which review segments each user has viewed
+
+```sql
+CREATE TABLE "userreviewstatus" (
+    "id"                INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    "user_id"           VARCHAR(30) NOT NULL,       -- Username or "anonymous"
+    "review_segment_id" VARCHAR(30) NOT NULL,       -- FK to reviewsegment
+    "has_been_reviewed" INTEGER NOT NULL DEFAULT 0, -- 0/1 boolean
+    FOREIGN KEY ("review_segment_id") REFERENCES "reviewsegment" ("id") ON DELETE CASCADE
+);
+
+-- Indexes
+CREATE UNIQUE INDEX "userreviewstatus_user_segment" ON "userreviewstatus" ("user_id", "review_segment_id");
+```
+
+---
+
+#### 6.3.5 `timeline` - Granular Event Timeline
+
+**Purpose:** Fine-grained timeline entries for detailed event history
+
+```sql
+CREATE TABLE "timeline" (
+    "timestamp"  DATETIME NOT NULL,          -- Event timestamp
+    "camera"     VARCHAR(20) NOT NULL,       -- Camera name
+    "source"     VARCHAR(20) NOT NULL,       -- "tracked_object", "audio", "external"
+    "source_id"  VARCHAR(30),                -- Reference ID (event_id, etc.)
+    "class_type" VARCHAR(50) NOT NULL,       -- "entered_zone", "audio_heard", etc.
+    "data"       JSON                        -- Additional metadata
+);
+
+-- Indexes
+CREATE INDEX "timeline_camera" ON "timeline" ("camera");
+CREATE INDEX "timeline_source" ON "timeline" ("source");
+CREATE INDEX "timeline_source_id" ON "timeline" ("source_id");
+```
+
+---
+
+#### 6.3.6 `previews` - Hour-Long Preview Clips
+
+**Purpose:** Low-resolution preview clips for quick timeline scrubbing
+
+```sql
+CREATE TABLE "previews" (
+    "id"         VARCHAR(30) NOT NULL PRIMARY KEY,
+    "camera"     VARCHAR(20) NOT NULL,
+    "path"       VARCHAR(255) NOT NULL UNIQUE,
+    "start_time" DATETIME NOT NULL,
+    "end_time"   DATETIME NOT NULL,
+    "duration"   REAL NOT NULL
+);
+
+-- Indexes
+CREATE INDEX "previews_camera" ON "previews" ("camera");
+```
+
+---
+
+#### 6.3.7 `export` - User-Created Exports
+
+**Purpose:** Tracks user-exported video clips
+
+```sql
+CREATE TABLE "export" (
+    "id"          VARCHAR(30) NOT NULL PRIMARY KEY,
+    "camera"      VARCHAR(20) NOT NULL,
+    "name"        VARCHAR(100) NOT NULL,       -- User-provided name
+    "date"        DATETIME NOT NULL,           -- Export creation date
+    "video_path"  VARCHAR(255) NOT NULL UNIQUE,
+    "thumb_path"  VARCHAR(255) NOT NULL UNIQUE,
+    "in_progress" INTEGER NOT NULL             -- 0/1 boolean
+);
+
+-- Indexes
+CREATE INDEX "export_camera" ON "export" ("camera");
+CREATE INDEX "export_name" ON "export" ("name");
+```
+
+---
+
+#### 6.3.8 `regions` - Detection Region Grid Cache
+
+**Purpose:** Caches auto-generated detection regions per camera
+
+```sql
+CREATE TABLE "regions" (
+    "camera"      VARCHAR(20) NOT NULL PRIMARY KEY,  -- Camera name
+    "grid"        JSON,                              -- Grid configuration
+    "last_update" DATETIME NOT NULL                  -- Last recalculation time
+);
+```
+
+---
+
+#### 6.3.9 `user` - Authentication
+
+**Purpose:** User accounts for multi-user access control
+
+```sql
+CREATE TABLE "user" (
+    "username"            VARCHAR(30) NOT NULL PRIMARY KEY,
+    "password_hash"       VARCHAR(120) NOT NULL,
+    "role"                VARCHAR(20) DEFAULT 'admin',  -- User role
+    "notification_tokens" JSON                          -- Push notification tokens
+);
+```
+
+---
+
+#### 6.3.10 `trigger` - Semantic Search Triggers
+
+**Purpose:** Stores user-defined semantic search triggers for alerts
+
+```sql
+CREATE TABLE "trigger" (
+    "camera"              VARCHAR(20) NOT NULL,
+    "name"                VARCHAR NOT NULL,
+    "type"                VARCHAR(10) NOT NULL,       -- "text" or "image"
+    "model"               VARCHAR(30) NOT NULL,       -- Embedding model name
+    "data"                TEXT NOT NULL,              -- Trigger text/description
+    "threshold"           REAL,                       -- Similarity threshold
+    "embedding"           BLOB,                       -- Pre-computed embedding vector
+    "triggering_event_id" VARCHAR(30),                -- Last triggered event
+    "last_triggered"      DATETIME,                   -- Last trigger time
+    PRIMARY KEY ("camera", "name")
+);
+```
+
+---
+
+#### 6.3.11 Virtual Tables: Semantic Search Embeddings
+
+**Purpose:** Vector similarity search using sqlite-vec extension
+
+```sql
+-- Thumbnail embeddings (image similarity search)
+CREATE VIRTUAL TABLE vec_thumbnails USING vec0(
+    id TEXT PRIMARY KEY,
+    thumbnail_embedding FLOAT[768] distance_metric=cosine
+);
+
+-- Description embeddings (text similarity search)
+CREATE VIRTUAL TABLE vec_descriptions USING vec0(
+    id TEXT PRIMARY KEY,
+    description_embedding FLOAT[768] distance_metric=cosine
+);
+```
+
+**How vector search works:**
+```sql
+-- Find events similar to a query embedding
+SELECT id, distance
+FROM vec_thumbnails
+WHERE thumbnail_embedding MATCH ?  -- query_embedding (768-dim float vector)
+ORDER BY distance
+LIMIT 10;
+```
+
+---
+
+#### 6.3.12 Index Summary
+
+| Table | Indexes | Purpose |
+|-------|---------|---------|
+| `recordings` | `camera`, `path` (unique), `(start_time, end_time)`, `(camera, segment_size)` | Time-range queries, storage cleanup |
+| `event` | `label`, `camera`, `(label, start_time DESC)` | Event filtering, explore page |
+| `reviewsegment` | `camera`, `(start_time DESC, end_time DESC)` | Timeline display |
+| `userreviewstatus` | `(user_id, review_segment_id)` (unique) | Per-user review state |
+| `timeline` | `camera`, `source`, `source_id` | Timeline queries |
+| `previews` | `camera` | Preview lookup |
+| `export` | `camera`, `name` | Export listing |
+| `trigger` | Primary key `(camera, name)` | Trigger lookup |
+
+---
+
+#### 6.3.13 Peewee ORM Model Reference
 
 **Source File:** `frigate/models.py`
 
-#### Recordings Table
 ```python
-class Recordings(Model):
-    id = CharField(primary_key=True)      # "{timestamp}-{rand_id}"
-    camera = CharField(index=True)         # Camera name
-    path = CharField(unique=True)          # Full file path
+from peewee import (
+    Model, CharField, DateTimeField, FloatField,
+    IntegerField, BooleanField, TextField, BlobField,
+    ForeignKeyField, CompositeKey
+)
+from playhouse.sqlite_ext import JSONField
 
-    start_time = DateTimeField()           # Segment start (UTC)
-    end_time = DateTimeField()             # Segment end (UTC)
-    duration = FloatField()                # Duration in seconds
-
-    # Metrics for retention decisions
-    motion = IntegerField()                # Motion frame count
-    objects = IntegerField()               # Active object count
-    regions = IntegerField()               # Detection region count
-    dBFS = IntegerField()                  # Audio level (decibels)
-    segment_size = FloatField()            # Size in MB
-```
-
-#### Event Table
-```python
 class Event(Model):
-    id = CharField(primary_key=True)
-    label = CharField(index=True)          # "person", "car", etc.
-    camera = CharField(index=True)
+    id = CharField(null=False, primary_key=True, max_length=30)
+    label = CharField(index=True, max_length=20)
+    sub_label = CharField(max_length=100, null=True)
+    camera = CharField(index=True, max_length=20)
     start_time = DateTimeField()
     end_time = DateTimeField()
+    # ... (full model in source)
 
-    has_clip = BooleanField(default=True)  # Has associated recording
-    has_snapshot = BooleanField(default=True)  # Has snapshot image
-    thumbnail = TextField()                 # Base64 encoded thumbnail
-    retain_indefinitely = BooleanField()   # Don't auto-delete
-    data = JSONField()                      # Detection metadata
-```
+class Recordings(Model):
+    id = CharField(null=False, primary_key=True, max_length=30)
+    camera = CharField(index=True, max_length=20)
+    path = CharField(unique=True)
+    start_time = DateTimeField()
+    end_time = DateTimeField()
+    duration = FloatField()
+    motion = IntegerField(null=True)
+    objects = IntegerField(null=True)
+    dBFS = IntegerField(null=True)
+    segment_size = FloatField(default=0)
+    regions = IntegerField(null=True)
 
-#### ReviewSegment Table
-```python
 class ReviewSegment(Model):
-    id = CharField(primary_key=True)
-    camera = CharField(index=True)
+    id = CharField(null=False, primary_key=True, max_length=30)
+    camera = CharField(index=True, max_length=20)
     start_time = DateTimeField()
     end_time = DateTimeField()
-    severity = CharField()                 # "alert" or "detection"
-    thumb_path = CharField(unique=True)    # Thumbnail file path
-    data = JSONField()                     # Labels, zones, motion data
+    severity = CharField(max_length=30)
+    thumb_path = CharField(unique=True)
+    data = JSONField()
+
+class Trigger(Model):
+    camera = CharField(max_length=20)
+    name = CharField()
+    type = CharField(max_length=10)
+    data = TextField()
+    threshold = FloatField()
+    model = CharField(max_length=30)
+    embedding = BlobField()
+    triggering_event_id = CharField(max_length=30)
+    last_triggered = DateTimeField()
+
+    class Meta:
+        primary_key = CompositeKey("camera", "name")
 ```
 
 ### 6.4 Directory Structure
