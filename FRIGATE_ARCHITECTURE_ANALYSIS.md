@@ -1134,6 +1134,37 @@ db = SqliteVecQueueDatabase(
 - **Auto-vacuum FULL** for automatic space reclamation
 - **SqliteQueueDatabase** - thread-safe wrapper from Peewee
 
+**IMPORTANT: SQLite and Multi-Process Architecture**
+
+SQLite is opened in the **main process only**. Child processes **cannot write directly** to SQLite because:
+1. SQLite connection is not shared across `fork()`
+2. SQLite doesn't handle multi-process writes well
+3. Database file locks would cause conflicts
+
+**Solution:** Child processes use **ZMQ REQ/REP** (InterProcessRequestor) to send write requests to the main process:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         MAIN PROCESS                                 │
+│  SQLite DB ◄─── Dispatcher receives requests via ZMQ REP           │
+│  (Peewee ORM)    and executes: Recordings.insert_many(...)          │
+└─────────────────────────────────────────────────────────────────────┘
+                              ▲
+                              │ ZMQ REQ/REP (ipc:///tmp/cache/comms)
+                              │
+      ┌───────────────────────┼───────────────────────┐
+      │                       │                       │
+      ▼                       ▼                       ▼
+┌───────────┐          ┌───────────┐          ┌───────────┐
+│ Recording │          │ Review    │          │ Event     │
+│ Process   │          │ Process   │          │ Process   │
+│           │          │           │          │           │
+│ requestor │          │ requestor │          │ requestor │
+│ .send_data│          │ .send_data│          │ .send_data│
+│ (INSERT...)│         │ (UPSERT...)│         │ (UPDATE...)│
+└───────────┘          └───────────┘          └───────────┘
+```
+
 ### 6.3 Database Schema (Key Tables)
 
 **Source File:** `frigate/models.py`
@@ -1355,9 +1386,271 @@ def expire_recordings():
 
 ---
 
-## 7. Scaling Architecture
+## 7. Inter-Process Communication (IPC) Patterns
 
-### 7.1 Process Model
+### 7.1 Overview
+
+Frigate uses **three main IPC patterns** for communication between processes:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           COMMUNICATION PATTERNS                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ 1. ZMQ Pub/Sub (Proxy)  → One-to-many broadcast (detections, events)        │
+│ 2. ZMQ REQ/REP          → Request-response (database writes, queries)       │
+│ 3. multiprocessing.Queue → Direct frame passing (detection queue)           │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.2 Pattern 1: ZMQ Pub/Sub Proxy (Detection Broadcasting)
+
+**Purpose:** Broadcast detection results from one publisher to multiple subscribers
+
+**Source Files:** `frigate/comms/zmq_proxy.py`, `frigate/comms/detections_updater.py`
+
+```
+                         ZMQ Proxy (XSUB/XPUB)
+                      ipc:///tmp/cache/proxy_pub
+                      ipc:///tmp/cache/proxy_sub
+                               │
+   PUBLISHERS                  │                    SUBSCRIBERS
+   ──────────                  │                    ───────────
+┌─────────────────┐            │            ┌─────────────────────┐
+│ TrackedObject   │            │            │ RecordingMaintainer │
+│ Processor       │───publish──┼──subscribe─│ (segment stats)     │
+└─────────────────┘            │            └─────────────────────┘
+                               │
+┌─────────────────┐            │            ┌─────────────────────┐
+│ AudioProcessor  │───publish──┼──subscribe─│ ReviewMaintainer    │
+└─────────────────┘            │            └─────────────────────┘
+                               │
+                               │            ┌─────────────────────┐
+                               ├──subscribe─│ EmbeddingMaintainer │
+                               │            └─────────────────────┘
+                               │
+                               │            ┌─────────────────────┐
+                               └──subscribe─│ OutputProcessor     │
+                                            └─────────────────────┘
+```
+
+**Topic Structure:**
+```
+detection/video  → Video frame detections (camera, objects, motion, regions)
+detection/audio  → Audio detections (camera, dBFS, audio_labels)
+detection/api    → Manual API-triggered detections
+detection/lpr    → License plate detections
+event/update     → Object tracking start/update
+event/finalized  → Object tracking ended
+recordings/saved → Segment saved to permanent storage
+```
+
+**Publisher Example:**
+```python
+# frigate/track/object_processing.py:765-775
+self.detection_publisher.publish(
+    (
+        camera,              # "front_door"
+        frame_name,          # "front_door_frame3"
+        frame_time,          # 1699876543.123
+        tracked_objects,     # [{id, label, box, score, ...}]
+        motion_boxes,        # [(x, y, w, h), ...]
+        regions,             # [(x, y, w, h), ...]
+    ),
+    DetectionTypeEnum.video.value,  # Topic suffix
+)
+# Sends to: "detection/video {json_payload}"
+```
+
+**Subscriber Example:**
+```python
+# frigate/record/maintainer.py:605-630
+(topic, data) = self.detection_subscriber.check_for_update(timeout=0.1)
+
+if topic == DetectionTypeEnum.video.value:
+    (camera, _, frame_time, objects, motion, regions) = data
+    self.object_recordings_info[camera].append(
+        (frame_time, objects, motion, regions)
+    )
+```
+
+### 7.3 Pattern 2: ZMQ REQ/REP (Database Writes via InterProcessRequestor)
+
+**Purpose:** Child processes request main process to write to SQLite (and wait for response)
+
+**Source Files:** `frigate/comms/inter_process.py`, `frigate/comms/dispatcher.py`
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         MAIN PROCESS                                 │
+│                                                                      │
+│  InterProcessCommunicator (zmq.REP)                                 │
+│  ipc:///tmp/cache/comms                                             │
+│         │                                                            │
+│         ▼                                                            │
+│  Dispatcher handles:                                                 │
+│    INSERT_MANY_RECORDINGS  → Recordings.insert_many(payload)        │
+│    UPSERT_REVIEW_SEGMENT   → ReviewSegment.insert(...).on_conflict()│
+│    INSERT_PREVIEW          → Previews.insert(payload)               │
+│    REQUEST_REGION_GRID     → Returns detection grid data            │
+│         │                                                            │
+│         ▼                                                            │
+│  SQLite (Peewee ORM)                                                │
+└─────────────────────────────────────────────────────────────────────┘
+                              ▲
+                              │ ZMQ REQ/REP
+                              │
+      ┌───────────────────────┼───────────────────────┐
+      ▼                       ▼                       ▼
+┌───────────┐          ┌───────────┐          ┌───────────┐
+│Recording  │          │Review     │          │Preview    │
+│Maintainer │          │Maintainer │          │Process    │
+└───────────┘          └───────────┘          └───────────┘
+```
+
+**InterProcessRequestor (Child Process Side):**
+```python
+# frigate/comms/inter_process.py:68-86
+class InterProcessRequestor:
+    def __init__(self):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)  # Request socket
+        self.socket.connect("ipc:///tmp/cache/comms")
+
+    def send_data(self, topic: str, data: Any) -> Any:
+        self.socket.send_json((topic, data))
+        return self.socket.recv_json()  # BLOCKS until response
+```
+
+**Usage in RecordingMaintainer:**
+```python
+# Child process wants to insert recordings
+recordings_to_insert = [
+    {"id": "123", "camera": "front", "path": "/media/...", ...},
+    {"id": "124", "camera": "front", "path": "/media/...", ...},
+]
+
+# Send to main process, wait for confirmation
+self.requestor.send_data(INSERT_MANY_RECORDINGS, recordings_to_insert)
+```
+
+**Dispatcher (Main Process Side):**
+```python
+# frigate/comms/dispatcher.py:114-115
+def _receive(self, topic: str, payload: Any):
+    if topic == INSERT_MANY_RECORDINGS:
+        Recordings.insert_many(payload).execute()
+        return {"success": True}
+```
+
+### 7.4 Pattern 3: multiprocessing.Queue (Frame Passing)
+
+**Purpose:** Pass detection requests from multiple cameras to shared detector
+
+**Source File:** `frigate/app.py:148-160`
+
+```python
+# Created once in main process
+self.detection_queue: Queue = mp.Queue()
+
+# Passed to all camera processes AND detector process
+# All cameras write to same queue, detector reads from it
+```
+
+```
+┌─────────────────┐     detection_queue    ┌─────────────────┐
+│ CameraTracker 1 │──────────┐             │                 │
+│ (front_door)    │          │             │ ObjectDetect    │
+└─────────────────┘          │             │ Process         │
+                             ├──────.put()─▶│                 │
+┌─────────────────┐          │             │ while True:     │
+│ CameraTracker 2 │──────────┤             │   .get()        │
+│ (backyard)      │          │             │   detect()      │
+└─────────────────┘          │             └────────┬────────┘
+                             │                      │
+┌─────────────────┐          │                      │ Results via
+│ CameraTracker N │──────────┘                      │ ZMQ Pub/Sub
+└─────────────────┘                                 ▼
+```
+
+**Why mp.Queue vs ZMQ for this?**
+
+| Aspect | mp.Queue | ZMQ Pub/Sub |
+|--------|----------|-------------|
+| **Pattern** | Many-to-one | One-to-many |
+| **Guarantee** | Messages never lost | Fire-and-forget |
+| **Backpressure** | Blocks when full | Drops if slow |
+| **Use case** | Detection requests (must not lose) | Broadcasts (ok to miss) |
+
+### 7.5 Why ZMQ Instead of Redis?
+
+Frigate chose ZMQ over Redis for these reasons:
+
+| Aspect | ZMQ (Frigate's choice) | Redis |
+|--------|------------------------|-------|
+| **Latency** | ~10-50μs (IPC sockets) | ~100-500μs (TCP overhead) |
+| **Dependency** | Library (no server) | External server required |
+| **Deployment** | Zero config | Redis to configure/maintain |
+| **Memory** | In-process | Separate process |
+| **Failure mode** | Process crash = local | Redis crash = all affected |
+
+**When Redis would make sense:**
+- Distributed across multiple machines
+- Need message persistence/replay
+- Already have Redis in your stack
+- Need caching alongside pub/sub
+
+### 7.6 IPC Data Flow Example
+
+**Complete flow: Camera frame → Database recording entry**
+
+```
+1. FFmpeg captures frame
+   └─▶ CameraCaptureRunner writes to SharedMemory
+       └─▶ /dev/shm/front_door_frame0
+
+2. CameraTracker detects motion
+   └─▶ Sends to detection_queue (mp.Queue)
+       └─▶ ObjectDetectProcess runs inference
+           └─▶ Returns via shared memory + ZMQ signal
+
+3. TrackedObjectProcessor publishes detection
+   └─▶ DetectionPublisher (ZMQ Pub/Sub)
+       Topic: "detection/video"
+       Payload: (camera, frame_name, time, objects, motion, regions)
+
+4. RecordingMaintainer subscribes & receives
+   └─▶ DetectionSubscriber gets message
+       └─▶ Stores in object_recordings_info[camera] (dict)
+
+5. Every 5 seconds: RecordingMaintainer processes segments
+   └─▶ Calculate segment stats from stored detection data
+       └─▶ If keep segment:
+           └─▶ FFmpeg moves cache → permanent
+               └─▶ InterProcessRequestor.send_data(
+                       INSERT_MANY_RECORDINGS,
+                       [{camera, path, motion, objects, ...}]
+                   )
+
+6. Dispatcher (main process) receives
+   └─▶ Recordings.insert_many(payload).execute()
+       └─▶ SQLite: INSERT INTO recordings (...)
+```
+
+### 7.7 IPC Summary Table
+
+| Component | Type | Direction | Use Case |
+|-----------|------|-----------|----------|
+| `mp.Queue` | multiprocessing.Queue | Many→One | Camera → Detector frames |
+| ZMQ Pub/Sub | XPUB/XSUB | One→Many | Detection results broadcast |
+| ZMQ REQ/REP | REQ/REP | Request-Response | Database writes |
+| Shared Memory | `/dev/shm` | Shared buffer | Zero-copy frame data |
+| `mp.Value` | multiprocessing.Value | Shared counter | FPS, timestamps |
+
+---
+
+## 8. Scaling Architecture
+
+### 8.1 Process Model
 
 **Per Camera:**
 - `CameraCapture` (Process) - FFmpeg frame capture
@@ -1369,7 +1662,7 @@ def expire_recordings():
 - `ReviewProcess` (Process) - Event review
 - `StorageMaintainer` (Process) - Storage cleanup
 
-### 7.2 Camera Scaling Summary
+### 8.2 Camera Scaling Summary
 
 | Cameras | Camera Processes | Detector Processes | FFmpeg Processes |
 |---------|------------------|-------------------|------------------|
@@ -1377,7 +1670,7 @@ def expire_recordings():
 | 16 | 32 | 1 | 16-32 |
 | 200 | 400 | 1+ (multi-detector) | 200-400 |
 
-### 7.3 Detection Queue Architecture
+### 8.3 Detection Queue Architecture
 
 ```
 Camera 1     Camera 2     Camera 3     ...     Camera N
@@ -1396,7 +1689,7 @@ RemoteObjectDetector (per camera, sends to shared queue)
 Camera 1     Camera 2     Camera 3     ...     Camera N
 ```
 
-### 7.4 Multi-Detector Configuration
+### 8.4 Multi-Detector Configuration
 
 For high camera counts, multiple detectors can be configured:
 
@@ -1413,11 +1706,143 @@ detectors:
     device: 0
 ```
 
+### 8.5 Single-Machine Architecture (Limitation)
+
+**Frigate is designed for single-machine deployment only.** All IPC mechanisms are local:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          SINGLE MACHINE                                  │
+│                                                                          │
+│   ┌─────────────────────────────────────────────────────────────────┐   │
+│   │  IPC Mechanisms (ALL LOCAL)                                      │   │
+│   │                                                                  │   │
+│   │  1. ZMQ IPC Sockets:                                            │   │
+│   │     ipc:///tmp/cache/proxy_pub    ← Unix domain socket          │   │
+│   │     ipc:///tmp/cache/proxy_sub    ← Unix domain socket          │   │
+│   │     ipc:///tmp/cache/comms        ← Unix domain socket          │   │
+│   │                                                                  │   │
+│   │  2. Shared Memory:                                               │   │
+│   │     /dev/shm/front_door_frame0    ← Local RAM                   │   │
+│   │     /dev/shm/backyard_frame0      ← Local RAM                   │   │
+│   │                                                                  │   │
+│   │  3. multiprocessing.Queue:                                       │   │
+│   │     Backed by pipes/shared memory ← Local IPC                   │   │
+│   │                                                                  │   │
+│   │  4. SQLite Database:                                             │   │
+│   │     /config/frigate.db            ← Local file                  │   │
+│   └─────────────────────────────────────────────────────────────────┘   │
+│                                                                          │
+│   ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐     │
+│   │ Camera 1 │ │ Camera 2 │ │ Camera 3 │ │   ...    │ │ Camera N │     │
+│   └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘     │
+│        │            │            │            │            │             │
+│        └────────────┴────────────┴────────────┴────────────┘             │
+│                          All on same host                                │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Why Frigate cannot span multiple machines:**
+
+| Component | Technology | Why Single-Machine Only |
+|-----------|------------|------------------------|
+| ZMQ Sockets | `ipc://` (Unix domain) | Unix sockets exist only within one host's filesystem |
+| Shared Memory | `/dev/shm` | RAM-backed tmpfs, not accessible across network |
+| mp.Queue | Unix pipes | Kernel pipes don't cross machine boundaries |
+| SQLite | Local file | No network protocol, file locking is local |
+| Process spawning | `multiprocessing.Process` | Spawns child processes on same machine |
+
+**Consequence for 50+ cameras:**
+
+```
+❌ What you CANNOT do:
+
+Machine A                          Machine B
+┌────────────┐                    ┌────────────┐
+│ Cameras    │                    │ Cameras    │
+│ 1-25       │                    │ 26-50      │
+│            │      ???           │            │
+│ Frigate    │◄─────────────────► │ Frigate    │
+│ Instance 1 │  No IPC possible   │ Instance 2 │
+└────────────┘                    └────────────┘
+
+✅ What you CAN do (workarounds):
+
+Option 1: Run completely separate Frigate instances
+┌────────────┐                    ┌────────────┐
+│ Frigate A  │                    │ Frigate B  │
+│ Cameras    │                    │ Cameras    │
+│ 1-25       │                    │ 26-50      │
+│            │                    │            │
+│ Own DB     │                    │ Own DB     │
+│ Own API    │                    │ Own API    │
+└────────────┘                    └────────────┘
+     │                                  │
+     └──────────► Aggregation ◄─────────┘
+                 Layer (your code)
+                 - Combine APIs
+                 - Unified dashboard
+
+Option 2: RTSP proxy with single big machine
+┌────────────┐     ┌─────────────────────────────┐
+│ NVR/Camera │     │      POWERFUL SINGLE        │
+│ Network    │     │      MACHINE                │
+│            │     │                             │
+│ 50 streams │────►│  Frigate                    │
+│ RTSP       │     │  - 50 camera processes      │
+└────────────┘     │  - Multiple detectors       │
+                   │  - 128GB+ RAM               │
+                   │  - Multi-GPU                │
+                   └─────────────────────────────┘
+```
+
+**If you need true multi-machine distribution, you would need to:**
+
+1. **Replace ZMQ IPC with TCP sockets:**
+   ```python
+   # Current (local only):
+   SOCKET_PUB = "ipc:///tmp/cache/proxy_pub"
+
+   # Distributed would need:
+   SOCKET_PUB = "tcp://192.168.1.100:5555"
+   ```
+
+2. **Replace shared memory with network storage or Redis:**
+   ```python
+   # Current: /dev/shm/camera_frame (zero-copy, local)
+   # Distributed: Network copy each frame (bandwidth intensive!)
+   # A single 1080p YUV frame = ~3MB
+   # At 5fps × 50 cameras = 750MB/sec network traffic
+   ```
+
+3. **Replace SQLite with PostgreSQL/MySQL:**
+   - Network-accessible database
+   - Connection pooling
+   - Replication for high availability
+
+4. **Replace mp.Queue with distributed queue (Redis, RabbitMQ):**
+   ```python
+   # Current
+   detection_queue = mp.Queue()
+
+   # Distributed
+   redis_client.lpush("detection_queue", frame_data)
+   ```
+
+**For your API-based system, consider:**
+
+If you need to scale beyond one machine:
+- Use Redis for IPC (already network-capable)
+- Use PostgreSQL for persistence
+- Use S3/MinIO for video storage
+- Each machine can run independent camera processes
+- Centralized detection workers pull from Redis queue
+
 ---
 
-## 8. Key Takeaways for System Design
+## 9. Key Takeaways for System Design
 
-### 8.1 FFmpeg Best Practices
+### 9.1 FFmpeg Best Practices
 
 1. **Use TCP for RTSP** - More reliable than UDP for most networks
 2. **Separate streams by role** - Sub-stream for detection, main for recording
@@ -1425,7 +1850,7 @@ detectors:
 4. **Segment muxer** - Creates atomic, recoverable recording segments
 5. **faststart flag** - Add when moving to permanent storage for seeking
 
-### 8.2 Process Management Patterns
+### 9.2 Process Management Patterns
 
 1. **Watchdog threads** - Monitor FFmpeg health, auto-restart on failure
 2. **LogPipe for stderr** - Capture FFmpeg logs without blocking
@@ -1433,7 +1858,7 @@ detectors:
 4. **Process isolation** - `start_new_session=True` for signal isolation
 5. **Graceful shutdown** - SIGTERM first, SIGKILL after timeout
 
-### 8.3 Frame Processing Optimization
+### 9.3 Frame Processing Optimization
 
 1. **Motion-first filtering** - Skip expensive operations on static frames
 2. **Region-based detection** - Only process areas with motion
@@ -1441,7 +1866,7 @@ detectors:
 4. **Downsampled motion** - 100px height is sufficient for motion
 5. **Stationary object caching** - Don't re-detect objects that haven't moved
 
-### 8.4 For Your API-Based System
+### 9.4 For Your API-Based System
 
 ```
 Recommended Architecture:
